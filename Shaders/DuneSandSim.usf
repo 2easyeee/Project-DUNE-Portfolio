@@ -1,0 +1,83 @@
+// Project DUNE: sand heightfield simulation (Day 17). Two small compute passes, both read one texture and write another (ping-pong).
+// The texture stores height as 0.5 + h / RangeCm (h in cm, 0.5 = untouched sand), the same encoding the sand material reads.
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float4> SrcTex;
+RWTexture2D<float4> DstTex;
+int2 Size;
+float RangeCm;
+float CellCm;			// world cm per texel
+float RecoverStepCm;	// how much a trail fades this pass (RecoverCmPerSec * dt)
+float2 WindCells;		// wind transport per pass in texels (signed, |x|+|y| <= 0.45 so the upwind scheme stays stable)
+float SlopeTan;			// stable slope (tan of the repose angle): height difference per cm between neighbours
+float SlopeRate;		// fraction of the excess that moves per pass (0 = no collapse)
+float MaxTransferCm;	// most one neighbour pair may exchange per pass
+
+float Height(int2 P)
+{
+	return (SrcTex.Load(int3(P, 0)).r - 0.5) * RangeCm;
+}
+
+void Store(int2 P, float H)
+{
+	DstTex[P] = float4(0.5 + H / RangeCm, 0.0, 0.0, 1.0);
+}
+
+bool Inside(int2 P)
+{
+	return all(P >= 0) && all(P < Size);
+}
+
+// pass 1: every trail fades towards untouched sand by a fixed number of cm per pass
+[numthreads(8, 8, 1)]
+void RecoverCS(uint3 Id : SV_DispatchThreadID)
+{
+	int2 P = int2(Id.xy);
+	if (!Inside(P)) return;
+	float H = Height(P);
+	Store(P, sign(H) * max(abs(H) - RecoverStepCm, 0.0));
+}
+
+// flux INTO the centre cell from one neighbour: slope above the stable angle slides the sand downhill.
+// The same pair gives the same number with the opposite sign from the other side, so no sand is made or lost.
+float SlopeFlux(float Centre, float Neighbour)
+{
+	float D = Neighbour - Centre;
+	float Excess = abs(D) - SlopeTan * CellCm;
+	if (Excess <= 0.0) return 0.0;
+	return sign(D) * min(SlopeRate * Excess, MaxTransferCm);
+}
+
+// first order upwind flux of the height deviation across the face between A (upwind) and the cell downstream of it
+float Upwind(float Upstream, float C)
+{
+	return Upstream * C;
+}
+
+// pass 2: slope collapse and wind transport, both written as fluxes between neighbouring cells
+[numthreads(8, 8, 1)]
+void FlowCS(uint3 Id : SV_DispatchThreadID)
+{
+	int2 P = int2(Id.xy);
+	if (!Inside(P)) return;
+	float H = Height(P);
+	float Delta = 0.0;
+
+	const int2 Dir[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+	[unroll]
+	for (int I = 0; I < 4; ++I)
+	{
+		int2 Q = P + Dir[I];
+		if (!Inside(Q)) continue; // nothing crosses the edge of the patch
+		float HQ = Height(Q);
+		Delta += SlopeFlux(H, HQ);
+
+		// wind: sand crosses the face between P and Q in the wind direction, carried by the upwind cell
+		float Wind = Dir[I].x != 0 ? WindCells.x : WindCells.y;
+		float Toward = -Wind * (Dir[I].x + Dir[I].y); // > 0 when the wind blows from the neighbour Q into P
+		if (Toward > 0.0) Delta += Upwind(HQ, Toward);
+		else Delta -= Upwind(H, -Toward);
+	}
+	Store(P, clamp(H + Delta, -0.49 * RangeCm, 0.49 * RangeCm));
+}
