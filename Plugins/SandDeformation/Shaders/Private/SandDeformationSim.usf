@@ -1,0 +1,236 @@
+// SandDeformation plugin: sand heightfield simulation (moved from Project DUNE Shaders/DuneSandSim.usf). Two small compute passes, both read one texture and write another (ping-pong).
+// The texture stores height as 0.5 + h / RangeCm (h in cm, 0.5 = untouched sand), the same encoding the sand material reads.
+
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float4> SrcTex;
+RWTexture2D<float4> DstTex;
+int2 Size;
+float RangeCm;
+float CellCm;			// world cm per texel
+float RecoverStepCm;	// how much a trail fades this pass (RecoverCmPerSec * dt)
+float2 WindCells;		// wind transport per pass in texels (signed, |x|+|y| <= 0.45 so the upwind scheme stays stable)
+float SlopeTan;			// stable slope (tan of the repose angle): height difference per cm between neighbours
+float SlopeRate;		// fraction of the excess that moves per pass (0 = no collapse)
+float MaxTransferCm;	// most one neighbour pair may exchange per pass
+
+float Height(int2 P)
+{
+	return (SrcTex.Load(int3(P, 0)).r - 0.5) * RangeCm;
+}
+
+void Store(int2 P, float H)
+{
+	DstTex[P] = float4(0.5 + H / RangeCm, 0.0, 0.0, 1.0);
+}
+
+bool Inside(int2 P)
+{
+	return all(P >= 0) && all(P < Size);
+}
+
+// pass 1: every trail fades towards untouched sand by a fixed number of cm per pass
+[numthreads(8, 8, 1)]
+void RecoverCS(uint3 Id : SV_DispatchThreadID)
+{
+	int2 P = int2(Id.xy);
+	if (!Inside(P)) return;
+	float H = Height(P);
+	Store(P, sign(H) * max(abs(H) - RecoverStepCm, 0.0));
+}
+
+// flux INTO the centre cell from one neighbour: slope above the stable angle slides the sand downhill.
+// The same pair gives the same number with the opposite sign from the other side, so no sand is made or lost.
+float SlopeFlux(float Centre, float Neighbour)
+{
+	float D = Neighbour - Centre;
+	float Excess = abs(D) - SlopeTan * CellCm;
+	if (Excess <= 0.0) return 0.0;
+	return sign(D) * min(SlopeRate * Excess, MaxTransferCm);
+}
+
+// first order upwind flux of the height deviation across the face between A (upwind) and the cell downstream of it
+float Upwind(float Upstream, float C)
+{
+	return Upstream * C;
+}
+
+// pass 2: slope collapse and wind transport, both written as fluxes between neighbouring cells
+[numthreads(8, 8, 1)]
+void FlowCS(uint3 Id : SV_DispatchThreadID)
+{
+	int2 P = int2(Id.xy);
+	if (!Inside(P)) return;
+	float H = Height(P);
+	float Delta = 0.0;
+
+	const int2 Dir[4] = { int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+	[unroll]
+	for (int I = 0; I < 4; ++I)
+	{
+		int2 Q = P + Dir[I];
+		if (!Inside(Q)) continue; // nothing crosses the edge of the patch
+		float HQ = Height(Q);
+		Delta += SlopeFlux(H, HQ);
+
+		// wind: sand crosses the face between P and Q in the wind direction, carried by the upwind cell
+		float Wind = Dir[I].x != 0 ? WindCells.x : WindCells.y;
+		float Toward = -Wind * (Dir[I].x + Dir[I].y); // > 0 when the wind blows from the neighbour Q into P
+		if (Toward > 0.0) Delta += Upwind(HQ, Toward);
+		else Delta -= Upwind(H, -Toward);
+	}
+	// the rim of the patch absorbs: wind carries sand towards it and nothing crosses it, so without a sink the sand would pile up there
+	float2 Edge = min(float2(P) + 0.5, float2(Size) - float2(P) - 0.5);
+	float Rim = saturate(min(Edge.x, Edge.y) / 24.0);
+	Rim = Rim * Rim * (3.0 - 2.0 * Rim);
+	Store(P, clamp((H + Delta) * Rim, -0.49 * RangeCm, 0.49 * RangeCm));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Day 18: footprints and landings. One pass applies up to 16 stamps (in order) to the heightfield: Dst = stamps(Src).
+// Stamp data, three float4 per stamp (all lengths in texels, heights in cm):
+//   A = (centre x, centre y, direction x, direction y)      direction = where the toes point (feet) / unused (round)
+//   B = (half length, half width, depth, ridge height)
+//   C = (type 0 foot / 1 round, noise seed, push, unused)   push = how far the sand is thrown back (0..1), running = more
+// Foot: an egg shaped outline (narrow heel, wide ball) with a flat pressed-down bottom and soft walls, heavier on heel and ball than on
+// the arch. Round (landing): wide soft dent, a thick ridge and a faint second ring (the shock wave).
+// The centre never gets deeper than the stamp however often it is walked over; the ridge only grows on sand that is not pressed down.
+// ---------------------------------------------------------------------------------------------------------------------------
+#define MAX_STAMPS 16
+float4 StampData[MAX_STAMPS * 3];
+int StampCount;
+
+float Hash21(float2 P)
+{
+	P = frac(P * float2(123.34, 456.21));
+	P += dot(P, P + 45.32);
+	return frac(P.x * P.y);
+}
+
+float ValueNoise(float2 P)
+{
+	float2 I = floor(P);
+	float2 F = frac(P);
+	F = F * F * (3.0 - 2.0 * F);
+	return lerp(lerp(Hash21(I), Hash21(I + float2(1, 0)), F.x), lerp(Hash21(I + float2(0, 1)), Hash21(I + float2(1, 1)), F.x), F.y);
+}
+
+float Smooth01(float X)
+{
+	X = saturate(X);
+	return X * X * (3.0 - 2.0 * X);
+}
+
+// Day 23: dent of a sphere pressed Depth cm into the sand. HalfWidth = half width of the circle where the sphere meets the surface (cm), R = distance from its centre (cm).
+// The sphere radius follows from the two: Rs = (a^2 + d^2) / 2d. The profile is the exact cap, so it is deepest in the middle and meets the surface at R = HalfWidth.
+float SphereCap(float Depth, float HalfWidth, float R)
+{
+	float D = max(Depth, 1e-3);
+	float Rs = (HalfWidth * HalfWidth + D * D) / (2.0 * D);
+	return max(0.0, sqrt(max(Rs * Rs - R * R, 0.0)) - (Rs - D));
+}
+
+[numthreads(8, 8, 1)]
+void StampCS(uint3 Id : SV_DispatchThreadID)
+{
+	int2 P = int2(Id.xy);
+	if (!Inside(P)) return;
+	float H = Height(P);
+	float2 Px = float2(P) + 0.5;
+	float2 Edge = min(Px, float2(Size) - Px);
+	float EdgeFade = Smooth01(min(Edge.x, Edge.y) / 24.0); // nothing is written at the rim of the patch
+
+	for (int S = 0; S < StampCount; ++S)
+	{
+		float4 A = StampData[S * 3 + 0];
+		float4 B = StampData[S * 3 + 1];
+		float4 C = StampData[S * 3 + 2];
+		int Flags = int(C.w + 0.5);
+		bool Sphere = (Flags & 1) != 0;
+		bool Accumulate = (Flags & 2) != 0; // C.z is the max depth then
+		float2 D = Px - A.xy;
+		float Reach = C.x < 1.5 ? max(B.x, B.y) * 2.6 : (B.x + B.y) * 1.8 + 4.0; // segments and boxes are long: reach from the centre covers the length plus the ridge
+		if (dot(D, D) > Reach * Reach) continue;
+
+		float Dent = 0.0;
+		float Ridge = 0.0;
+		float Noise = 0.8 + 0.4 * ValueNoise(Px * 0.09 + C.y * 17.0); // uneven, not a clean ring
+		if (C.x < 0.5)
+		{
+			float2 Dir = A.zw;
+			float U = dot(D, Dir) / B.x;
+			float V = (Dir.x * D.y - Dir.y * D.x) / B.y;
+			float Taper = lerp(0.62, 1.0, Smooth01((U + 1.0) / 1.4)); // narrow heel, wide ball
+			float E = length(float2(U, V / Taper));
+			// the wall of the print is a little ragged (sand crumbles at the rim)
+			E *= 1.0 + 0.07 * (ValueNoise(Px * 0.5 + C.y * 31.0) - 0.5);
+			float Press = 1.0 - 0.35 * exp(-pow((U - 0.0) / 0.3, 2.0)) - 0.35 * Smooth01((U - 0.55) / 0.4); // arch and toes press less than heel and ball
+			Dent = B.z * Press * Smooth01((1.0 - E) / 0.3);
+			float R = 1.0 - abs(E - 1.3) / 0.42;
+			Ridge = B.w * Smooth01(R) * Noise * (1.0 + C.z * 0.9 * saturate(-U + 0.2)); // running throws sand back behind the heel
+		}
+		else if (C.x >= 2.5)
+		{
+			// box (type 3): a rounded rectangle, half length B.x along the direction, half width B.y; a flat pressed bottom and a ridge band just outside
+			float2 Dir = A.zw;
+			float2 Q = abs(float2(dot(D, Dir), Dir.x * D.y - Dir.y * D.x)) - float2(B.x, B.y);
+			float Sd = length(max(Q, 0.0)) + min(max(Q.x, Q.y), 0.0); // texels, negative inside
+			float Small = min(B.x, B.y);
+			float Soft = max(2.0, 0.3 * Small);
+			Sd *= 1.0 + 0.05 * (ValueNoise(Px * 0.4 + C.y * 31.0) - 0.5);
+			Dent = B.z * Smooth01(-Sd / Soft);
+			float Wr = max(3.0, 0.4 * Small);
+			float R = 1.0 - abs(Sd - 0.9 * Wr) / (0.8 * Wr);
+			Ridge = B.w * Smooth01(R) * Noise;
+		}
+		else if (C.x >= 1.5)
+		{
+			// segment (type 2): a wheel track from A.xy - Dir * B.x to A.xy + Dir * B.x, half width B.y; round ends, so consecutive segments join without a gap
+			float2 Dir = A.zw;
+			float U = dot(D, Dir);
+			float V = Dir.x * D.y - Dir.y * D.x;
+			float E = length(float2(U - clamp(U, -B.x, B.x), V)) / B.y;
+			E *= 1.0 + 0.05 * (ValueNoise(Px * 0.3 + C.y * 31.0) - 0.5);
+			Dent = B.z * Smooth01((1.0 - E) / 0.35);
+			if (Sphere) Dent = SphereCap(B.z, B.y * CellCm, E * B.y * CellCm); // a rolling ball: round bottomed groove
+			float R = 1.0 - abs(E - 1.3) / 0.45;
+			Ridge = B.w * Smooth01(R) * Noise;
+		}
+		else
+		{
+			float E = length(D) / B.x;
+			E *= 1.0 + 0.08 * (ValueNoise(Px * 0.15 + C.y * 31.0) - 0.5);
+			Dent = B.z * Smooth01((1.0 - E) / 0.7);
+			float R = 1.0 - abs(E - 1.35) / 0.45;
+			float Wave = 1.0 - abs(E - 2.5) / 0.9; // the shock wave: a faint second ring
+			Ridge = (B.w * Smooth01(R) + 0.12 * B.w * Smooth01(Wave)) * Noise;
+			if (Sphere)
+			{
+				Dent = SphereCap(B.z, B.x * CellCm, length(D) * CellCm);
+				Ridge = B.w * Smooth01(R) * Noise; // no shock wave ring: a ball does not hit like a landing
+			}
+		}
+		Dent *= EdgeFade;
+		Ridge *= EdgeFade;
+		// absolute: never deeper than this stamp. Accumulate (repeated landings): add Dent on top of the current depth; the closer the sand is to its max depth, the less one more landing digs
+		float H1 = Accumulate ? H - Dent * saturate(1.0 + H / max(C.z, 0.1)) : H - saturate(Dent * 50.0) * max(0.0, H + Dent); // Dent 0 leaves the height alone
+		float Gate = saturate((H1 + 0.05) * 20.0);
+		H = H1 + Gate * max(0.0, Ridge - H1);
+	}
+	Store(P, clamp(H, -0.49 * RangeCm, 0.49 * RangeCm));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Scrolling patch (Day 19): the heightfield follows an actor. Dst(p) = Src(p + ScrollShift); texels that come from outside the old patch are untouched sand.
+// ---------------------------------------------------------------------------------------------------------------------------
+int2 ScrollShift;
+
+[numthreads(8, 8, 1)]
+void ScrollCS(uint3 Id : SV_DispatchThreadID)
+{
+	int2 P = int2(Id.xy);
+	if (!Inside(P)) return;
+	int2 Q = P + ScrollShift;
+	DstTex[P] = Inside(Q) ? SrcTex.Load(int3(Q, 0)) : float4(0.5, 0.0, 0.0, 1.0);
+}
+

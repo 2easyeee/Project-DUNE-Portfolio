@@ -1,0 +1,31 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "Sand Deformation",
+	"Description": "Runtime sand deformation: footprints, landing craters, raised rims, wind and slope collapse on a GPU heightfield that follows an actor.",
+	"Category": "Rendering",
+	"CreatedBy": "Project DUNE",
+	"CanContainContent": true,
+	"IsBetaVersion": true,
+	"EngineVersion": "5.8.0",
+	"SupportedTargetPlatforms": [ "Win64" ],
+	"Modules": [
+		{
+			"Name": "SandDeformationShaders",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "SandDeformation",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "ProceduralMeshComponent",
+			"Enabled": true
+		}
+	]
+}
